@@ -1,0 +1,164 @@
+#include <Arduino.h>
+
+const byte L_DIR = 4;
+const byte L_PWM = 5;
+const byte R_DIR = 7;
+const byte R_PWM = 6;
+const bool L_INVERT = true;
+const bool R_INVERT = true;
+const byte leftSensorPin = A0;
+const byte rightSensorPin = A1;
+
+const int leftWhite = 34;
+const int leftBlack = 560;
+const int rightWhite = 40;
+const int rightBlack = 720;
+
+
+const int baseSpeed = 75;
+float Kp = 0.02;
+float Kd = 0.03;
+const int steerSign = -1;
+const int minPWM = 55;
+const int maxCorrection = 25;
+const int pwmStep = 2;
+
+const int crossThreshold = 600;  // 
+const int axisTime = 300;        // мс доезда 
+const unsigned long searchTime = 30000; 
+
+int lastError = 0;
+int leftPower = 0;
+int rightPower = 0;
+
+// 0 = белое, 1000 = черное
+int readSensor(byte pin, int white, int black) {
+    if (white == black) return 0;
+    int sum = 0;
+    for (int i = 0; i < 4; i++) sum += analogRead(pin);
+    return constrain(map(sum / 4, white, black, 0, 1000), 0, 1000);
+}
+
+int readLeft() {
+    return readSensor(leftSensorPin, leftWhite, leftBlack);
+}
+
+int readRight() {
+    return readSensor(rightSensorPin, rightWhite, rightBlack);
+}
+
+bool isCross() {
+    return readLeft() >= crossThreshold && readRight() >= crossThreshold;
+}
+
+void motor(byte dirPin, byte pwmPin, bool invert, int power) {
+    power = constrain(power, -255, 255);
+    bool forward = power >= 0;
+    if (invert) forward = !forward;
+    digitalWrite(dirPin, forward ? HIGH : LOW);
+    analogWrite(pwmPin, abs(power));
+}
+
+void setPowers(int left, int right) {
+    motor(L_DIR, L_PWM, L_INVERT, left);
+    motor(R_DIR, R_PWM, R_INVERT, right);
+}
+
+void stopMotors() {
+    setPowers(0, 0);
+    leftPower = 0;
+    rightPower = 0;
+    lastError = 0;
+}
+
+void smoothPowers(int left, int right) {
+    leftPower += constrain(left - leftPower, -pwmStep, pwmStep);
+    rightPower += constrain(right - rightPower, -pwmStep, pwmStep);
+    setPowers(leftPower, rightPower);
+    delay(5);
+}
+
+void PD(int speed) {
+    speed = constrain(speed, 0, 255);
+    if (speed == 0) {
+        stopMotors();
+        return;
+    }
+    int error = readLeft() - readRight();
+    if (abs(error) < 20) error = 0;
+    int u = Kp * error + Kd * (error - lastError);
+    lastError = error;
+    u *= steerSign;
+    u = constrain(u, -maxCorrection, maxCorrection);
+
+    int minimum = min(minPWM, speed);
+    int left = constrain(speed + u, minimum, 255);
+    int right = constrain(speed - u, minimum, 255);
+    smoothPowers(left, right);
+}
+
+
+void lineCross(int speed, int n) {
+    speed = constrain(speed, 0, 255);
+    if (speed == 0 || n <= 0) {
+        stopMotors();
+        return;
+    }
+
+    int count = 0;
+    int blackCount = 0;
+    int whiteCount = 0;
+    bool wasCross = isCross(); 
+    lastError = readLeft() - readRight();
+    unsigned long started = millis();
+
+    while (count < n && millis() - started < searchTime) {
+        PD(speed);
+        if (isCross()) {
+            blackCount++;
+            whiteCount = 0;
+            
+            if (blackCount >= 3 && !wasCross) {
+                count++;
+                wasCross = true;
+            }
+        } else {
+            whiteCount++;
+            blackCount = 0;
+            if (whiteCount >= 3) wasCross = false;
+        }
+    }
+
+    if (count == n) {
+    
+        started = millis();
+        while (axisTime > 0 && millis() - started < (unsigned long)axisTime) {
+            smoothPowers(speed, speed);
+        }
+    } else {
+        Serial.println("Cross not found: stopped.");
+    }
+    stopMotors();
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(L_DIR, OUTPUT);
+    pinMode(L_PWM, OUTPUT);
+    pinMode(R_DIR, OUTPUT);
+    pinMode(R_PWM, OUTPUT);
+    pinMode(leftSensorPin, INPUT);
+    pinMode(rightSensorPin, INPUT);
+    stopMotors();
+    if (leftWhite == leftBlack || rightWhite == rightBlack) {
+        Serial.println("Check sensor calibration.");
+        while (true) delay(100);
+    }
+    delay(1000);
+}
+
+void loop() {
+
+    PD(70);
+
+}
