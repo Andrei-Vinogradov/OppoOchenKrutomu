@@ -1,59 +1,564 @@
 #include <Arduino.h>
-#include "../include/SoundSensor.h"
-#include "../include/Motor.h"
-#include "../include/LineSensor.h"
 
-float Kp = 1.5;
-float Kd = 15;
-int lastError = 0;
-int valueSensor1;
-int valueSensor2;
+// Один файл для Arduino IDE. Плата: Arduino Uno / Iskra Uno.
+// На Motor Shield Plus снять перемычки измерения тока с A0/A1:
+// эти входы заняты датчиками линии. DIR/EN и PWR JOIN к ним не относятся.
+// Источники: amperka.ru/product/arduino-motor-shield-plus;
+// github.com/Innopolis-Robotics-Society/mobile-robots-school
 
-void setup()
-{
-  Serial.begin(9600);
+// Пины нынешнего робота
+const byte L_DIR = 4, L_PWM = 5;
+const byte R_DIR = 7, R_PWM = 6;
+const byte leftSensorPin = A0, rightSensorPin = A1;
+const byte encoderLeftPin = 2, encoderRightPin = 3; // каналы A, по карте школы
+// Каналы B (D8, D12) здесь не используем: считаем только RISING канала A.
 
-  calibration();
-  pinMode(L_DIR, OUTPUT);
-  pinMode(R_DIR, OUTPUT);
+// Твои рабочие настройки езды: сохранены.
+const int leftWhite = 40, leftBlack = 780;
+const int rightWhite = 40, rightBlack = 740;
+const int baseSpeed = 70;
+float Kp = 0.016, Kd = 0.4;
+const int minPWM = 58;
+const int maxCorrection = 25;
+const int pwmStep = 1;
+const int crossThreshold = 850;
+// Боковые Т-перекрёстки: включать ТОЛЬКО после проверки на своей трассе.
+// false сохраняет прежнее распознавание: оба датчика видят чёрное.
+const bool detectSideT = false;
+const float sideTMinCm = 1.5f; // один датчик на чёрном на протяжении >= 1.5 см
+const int sideTOtherMax = 350; // второй датчик при этом должен быть светлым
+const float minCrossGapCm = 4.0f; // защита от повторного счёта одного перекрёстка
 
-  Serial.println("Все системы настроены...");
-  
-  delay(200);
+// Энкодер: один канал, только RISING; 11 импульсов * редуктор 45.
+const long ticksPerWheel = 11L * 45; // 495 на оборот КОЛЕСА
+const float wheelDiameterMm = 72.0;
+const float mmPerTick = 3.14159265f * wheelDiameterMm / ticksPerWheel;
+float wheelBaseMm = 183.4; // ЗАМЕРИТЬ между серединами левого и правого колёс, мм
+float turnCorrection = 1.0; // поправка угла после проверки на покрытии
+
+// Синхронизация колёс. Это отдельные коэффициенты, не Kp/Kd линии.
+float Kp_sync = 0.35, Kd_sync = 0.1;
+const int maxSyncCorrection = 15;
+
+// Доезд после обнаружения перекрёстка.
+float axisOffsetCm = -1; // -1: прежние axisTime мс; >= 0: расстояние по энкодерам
+const int axisTime = 300; // подобрать доезд до оси на роботе
+
+// Поворот до линии: ширина окна поиска зависит от расположения датчиков.
+// Начальное значение 25: искать за 25 градусов до заданного угла и до +25.
+const int turnSearchDegrees = 25;
+const int turnAlignPWM = minPWM + 5;
+const int turnCenterError = 170;
+
+const unsigned long moveTimeout = 120000; // 2 мин для длинных проездов
+const unsigned long turnTimeout = 20000;
+const unsigned long stallTime = 1500; // нет импульсов движущегося колеса — стоп
+const unsigned long stopPauseMs = 100; // увеличить, если после PWM=0 выбег длится дольше
+const bool calibrationMode = false; // true: только показания в Serial, моторы стоят
+
+volatile long leftTicks = 0, rightTicks = 0;
+int leftPower = 0, rightPower = 0, lastError = 0;
+int lineLeft = 0, lineRight = 0;
+long previousLeftTicks = 0, previousRightTicks = 0;
+unsigned long leftMovedAt = 0, rightMovedAt = 0;
+unsigned long stoppedAt = 0;
+
+// Одноканальные энкодеры считают путь без знака, в том числе при движении назад.
+void countLeft() { leftTicks++; }
+void countRight() { rightTicks++; }
+
+void resetEncoders() {
+    noInterrupts();
+    leftTicks = rightTicks = 0;
+    interrupts();
+    previousLeftTicks = previousRightTicks = 0;
+    leftMovedAt = rightMovedAt = millis();
 }
 
-void movement()
-{
-  valueSensor1 = readNorm(0);
-  valueSensor2 = readNorm(1);
-  
-  // Игнорируем перекресток
-  /*if (valueSensor1 >= BORDER_BLACK && valueSensor2 >= BORDER_BLACK)
-  {
-    drive(SPEED_FORWARD, SPEED_FORWARD);
-    lastError = 0;
-
-    return;
-  }*/
-
-  // Ошибка - величина отклонения от линии
-  int error = valueSensor1 - valueSensor2;
-  int derivative = error - lastError;
-  // Корректировка - восстановительное значение для возврата на линию
-  int U = Kp * error + Kd * derivative;
-  // Ограничение корректировки (без неё - слишком резкие движения)
-  U = constrain(U, -SPEED, SPEED); 
-  
-  int leftMotorSpeed = SPEED + U;
-  int rightMotorSpeed = SPEED - U;
-  
-  drive(leftMotorSpeed, rightMotorSpeed);
-  
-  lastError = error;
+void readTicks(long &left, long &right) {
+    noInterrupts();
+    left = leftTicks;
+    right = rightTicks;
+    interrupts();
 }
 
-void loop() 
-{
-  movement();
+long enc() {
+    long left, right;
+    readTicks(left, right);
+    return (left + right) / 2;
 }
 
+long cmToTicks(float cm) {
+    if (cm <= 0) return 0;
+    return (long)(cm * 10.0f / mmPerTick + 0.5f);
+}
+
+int readRaw(byte pin) {
+    int sum = 0;
+    for (int i = 0; i < 4; i++) sum += analogRead(pin);
+    return sum / 4;
+}
+
+int readSensor(byte pin, int white, int black) {
+    if (white == black) return 0;
+    long value = map(readRaw(pin), white, black, 0, 1000);
+    return constrain(value, 0L, 1000L);
+}
+
+int readLeft() { return readSensor(leftSensorPin, leftWhite, leftBlack); }
+int readRight() { return readSensor(rightSensorPin, rightWhite, rightBlack); }
+bool isCross() { return readLeft() >= crossThreshold && readRight() >= crossThreshold; }
+
+// Плюс — вперёд. У нынешнего робота LOW = вперёд на обоих моторах.
+void setPowers(int left, int right) {
+    left = constrain(left, -255, 255);
+    right = constrain(right, -255, 255);
+    digitalWrite(L_DIR, left >= 0 ? LOW : HIGH);
+    digitalWrite(R_DIR, right >= 0 ? LOW : HIGH);
+    analogWrite(L_PWM, abs(left));
+    analogWrite(R_PWM, abs(right));
+}
+
+void stopMotors() {
+    setPowers(0, 0); // L6206Q: EN = 0, свободный выбег, без активного тормоза EV3
+    leftPower = rightPower = lastError = 0;
+    stoppedAt = millis();
+}
+
+// Даём колёсам успокоиться перед сбросом энкодеров.
+// Если робот продолжает ехать, паузы нет.
+void waitForStop() {
+    if (leftPower != 0 || rightPower != 0) return;
+    unsigned long elapsed = millis() - stoppedAt;
+    if (elapsed < stopPauseMs) delay(stopPauseMs - elapsed);
+}
+
+void stopWithError(const char *message) {
+    stopMotors();
+    Serial.println(message);
+    while (true) delay(100); // не продолжаем маршрут после ошибки
+}
+
+void checkEncoders(long left, long right, bool leftActive, bool rightActive) {
+    unsigned long now = millis();
+    if (left != previousLeftTicks) leftMovedAt = now;
+    if (right != previousRightTicks) rightMovedAt = now;
+    previousLeftTicks = left;
+    previousRightTicks = right;
+    if (leftActive && now - leftMovedAt >= stallTime)
+        stopWithError("STOP: left encoder / wheel stalled.");
+    if (rightActive && now - rightMovedAt >= stallTime)
+        stopWithError("STOP: right encoder / wheel stalled.");
+}
+
+void smoothPowers(int left, int right) {
+    leftPower += constrain(left - leftPower, -pwmStep, pwmStep);
+    rightPower += constrain(right - rightPower, -pwmStep, pwmStep);
+    setPowers(leftPower, rightPower);
+    delay(5); // период твоего регулятора: при настройке Kd не менять
+}
+
+// Один шаг твоего рабочего регулятора линии.
+void PD(int speed) {
+    speed = constrain(speed, 0, 255);
+    if (speed == 0) { stopMotors(); return; }
+    lineLeft = readLeft();
+    lineRight = readRight();
+    int error = lineLeft - lineRight;
+    if (abs(error) < 20) error = 0;
+    int u = Kp * error + Kd * (error - lastError);
+    lastError = error;
+    u = constrain(u, -maxCorrection, maxCorrection);
+    int minimum = min(minPWM, speed);
+    smoothPowers(constrain(speed - u, minimum, 255),
+                 constrain(speed + u, minimum, 255));
+}
+
+// Профиль из твоей библиотеки: разгон, постоянная скорость, торможение.
+// Расстояния здесь уже в импульсах. Нулевой участок пропускается.
+int profileSpeed(int speed, long passed, long total, long start, long brake) {
+    int minimum = min(minPWM, speed);
+    int power = speed;
+    start = constrain(start, 0L, total);
+    brake = constrain(brake, 0L, total);
+    if (start > 0 && passed < start)
+        power = min(power, minimum + (long)(speed - minimum) * passed / start);
+    long remaining = max(0L, total - passed);
+    if (brake > 0 && remaining < brake)
+        power = min(power, minimum + (long)(speed - minimum) * remaining / brake);
+    return power;
+}
+
+// Общая часть проездов ПО ЛИНИИ. Для маршрута удобнее функции ниже.
+void lineDistance(int speed, long ticks, long start, long brake, bool stopAtEnd) {
+    speed = constrain(speed, 0, 255);
+    if (speed == 0 || ticks <= 0) { stopMotors(); return; }
+    if (leftPower < 0 || rightPower < 0) stopMotors();
+    waitForStop();
+    resetEncoders();
+    lastError = readLeft() - readRight();
+    unsigned long started = millis();
+    while (true) {
+        long left, right;
+        readTicks(left, right);
+        checkEncoders(left, right, true, true);
+        long passed = (left + right) / 2;
+        if (passed >= ticks && left > 0 && right > 0) break;
+        if (millis() - started >= moveTimeout) stopWithError("STOP: move timeout.");
+        PD(profileSpeed(speed, passed, ticks, start, brake));
+    }
+    if (stopAtEnd) stopMotors();
+}
+
+// Прежняя функция: число СРЕДНИХ импульсов колёс, в конце стоп.
+void lineEncoder(int speed, long ticks) {
+    lineDistance(speed, ticks, 0, 0, true);
+}
+
+// По линии в сантиметрах, в конце стоп.
+void lineCm(int speed, float cm) {
+    lineEncoder(speed, cmToTicks(cm));
+}
+
+// Как на Клевере: все три расстояния в СМ. Разгон/торможение могут быть 0.
+void line_encoder(int speed, float cm, float startCm, float brakeCm) {
+    lineDistance(speed, cmToTicks(cm), cmToTicks(startCm), cmToTicks(brakeCm), true);
+}
+
+// Движение по энкодерам БЕЗ датчиков линии.
+// ticks — средний путь двух колёс; знаки скоростей задают направления.
+void syncTicks(int leftBase, int rightBase, long ticks, long start, long brake, unsigned long timeout) {
+    leftBase = constrain(leftBase, -255, 255);
+    rightBase = constrain(rightBase, -255, 255);
+    int leftAbs = abs(leftBase), rightAbs = abs(rightBase);
+    int sum = leftAbs + rightAbs;
+    if (sum == 0 || ticks <= 0) { stopMotors(); return; }
+    bool reverseLeft = (leftPower > 0 && leftBase < 0) || (leftPower < 0 && leftBase > 0);
+    bool reverseRight = (rightPower > 0 && rightBase < 0) || (rightPower < 0 && rightBase > 0);
+    if (reverseLeft || reverseRight) stopMotors();
+    waitForStop();
+    resetEncoders();
+    float scale = 2.0f * ticks / sum;
+    long leftTarget = leftAbs ? max(1L, (long)(scale * leftAbs + 0.5f)) : 0;
+    long rightTarget = rightAbs ? max(1L, (long)(scale * rightAbs + 0.5f)) : 0;
+    int largest = max(leftAbs, rightAbs);
+    long lastSyncError = 0;
+    unsigned long started = millis();
+    while (true) {
+        long left, right;
+        readTicks(left, right);
+        bool leftDone = left >= leftTarget, rightDone = right >= rightTarget;
+        if (leftDone && rightDone) break;
+        checkEncoders(left, right, !leftDone, !rightDone);
+        if (millis() - started >= timeout) stopWithError("STOP: move timeout.");
+        long passed = (left + right) / 2;
+        int l = profileSpeed(leftAbs, passed, ticks, start, brake);
+        int r = profileSpeed(rightAbs, passed, ticks, start, brake);
+        if (leftAbs && rightAbs) {
+            long error = (long)(((float)left * rightAbs - (float)right * leftAbs) / largest);
+            float correction = Kp_sync * error + Kd_sync * (error - lastSyncError);
+            lastSyncError = error;
+            // Ограничиваем ДО приведения к 16-битному int на Uno.
+            int u = constrain(correction, -maxSyncCorrection, maxSyncCorrection);
+            l = constrain(l - u, min(minPWM, leftAbs), 255);
+            r = constrain(r + u, min(minPWM, rightAbs), 255);
+        }
+        l = leftBase < 0 ? -l : l;
+        r = rightBase < 0 ? -r : r;
+        if (leftDone) { l = 0; leftPower = 0; }
+        if (rightDone) { r = 0; rightPower = 0; }
+        smoothPowers(l, r);
+    }
+    stopMotors();
+}
+
+// Как sync_move на Клевере, но знаки моторов уже учтены: плюс = вперёд.
+// cm — средний путь двух колёс. Если одно стоит, второе проедет 2 * cm.
+void sync_move(int left, int right, float cm, float startCm, float brakeCm) {
+    syncTicks(left, right, cmToTicks(cm), cmToTicks(startCm), cmToTicks(brakeCm), moveTimeout);
+}
+
+// Прямо без линии: положительная скорость вперёд, отрицательная назад.
+void moveCm(int speed, float cm) {
+    sync_move(speed, speed, cm, 0, 0);
+}
+
+// Общий проезд к перекрёсткам.
+// stopType: 0 — проехать без остановки; 1 — стоп; 2 — замедлиться перед стопом.
+void crossing(int speed, int n, float afterCm, float startCm, int stopType) {
+    speed = constrain(speed, 0, 255);
+    if (speed == 0 || n <= 0) { stopMotors(); return; }
+    if (stopType < 0 || stopType > 2) stopWithError("STOP: stopType must be 0, 1 or 2.");
+    if (leftPower < 0 || rightPower < 0) stopMotors();
+    waitForStop();
+    if (startCm > 0)
+        lineDistance(speed, cmToTicks(startCm), cmToTicks(startCm), 0, false);
+    resetEncoders();
+    int count = 0;
+    bool wasCross = isCross(); // стартовый перекрёсток пропускаем
+    long sideStart = -1;       // начало возможного бокового Т, в импульсах
+    long lastCountedAt = -1;   // последний учтённый перекрёсток
+    const long minCrossGap = cmToTicks(minCrossGapCm);
+    lastError = readLeft() - readRight();
+    unsigned long started = millis();
+    while (count < n) {
+        long left, right;
+        readTicks(left, right);
+        checkEncoders(left, right, true, true);
+        if (millis() - started >= moveTimeout) stopWithError("STOP: crossing not found.");
+        PD(speed);
+        // Используем ту же пару измерений, что и PD, без лишних analogRead.
+        bool cross = lineLeft >= crossThreshold && lineRight >= crossThreshold;
+        bool sideCross = false;
+        if (detectSideT && !cross) {
+            bool oneBlack = (lineLeft >= crossThreshold && lineRight <= sideTOtherMax) ||
+                            (lineRight >= crossThreshold && lineLeft <= sideTOtherMax);
+            if (oneBlack) {
+                if (sideStart < 0) sideStart = (left + right) / 2;
+                sideCross = (left + right) / 2 - sideStart >= cmToTicks(sideTMinCm);
+            } else sideStart = -1;
+        } else sideStart = -1;
+        if (sideCross) cross = true;
+        if (cross != wasCross) {
+            delay(10);
+            int checkL = readLeft(), checkR = readRight();
+            bool confirmed = checkL >= crossThreshold && checkR >= crossThreshold;
+            if (detectSideT && sideCross) {
+                // За время подтверждения должен остаться чёрным тот же датчик.
+                confirmed = (lineLeft >= crossThreshold && checkL >= crossThreshold && checkR <= sideTOtherMax) ||
+                            (lineRight >= crossThreshold && checkR >= crossThreshold && checkL <= sideTOtherMax);
+            }
+            if (confirmed == cross) {
+                if (cross) {
+                    long position = (left + right) / 2;
+                    if (lastCountedAt < 0 || position - lastCountedAt >= minCrossGap) {
+                        count++;
+                        lastCountedAt = position;
+                    }
+                }
+                wasCross = cross;
+            }
+        }
+    }
+    if (stopType == 0) return; // после этого сразу должна идти следующая команда
+    if (afterCm >= 0) {
+        long ticks = cmToTicks(afterCm);
+        long brake = stopType == 2 ? cmToTicks(min(afterCm, 5.0f)) : 0;
+        if (ticks > 0) syncTicks(speed, speed, ticks, 0, brake, moveTimeout);
+    } else {
+        started = millis();
+        while (axisTime > 0 && millis() - started < (unsigned long)axisTime) {
+            long left, right;
+            readTicks(left, right);
+            checkEncoders(left, right, true, true);
+            int power = speed;
+            if (stopType == 2) {
+                long remaining = max(0L, (long)axisTime - (long)(millis() - started));
+                int minimum = min(minPWM, speed);
+                power = minimum + (long)(speed - minimum) * remaining / axisTime;
+            }
+            smoothPowers(power, power);
+        }
+    }
+    stopMotors();
+}
+
+// Прежний вызов: до n-го перекрёстка, доезд до оси, стоп.
+void lineCross(int speed, int n) {
+    crossing(speed, n, axisOffsetCm, 0, 1);
+}
+
+// Тот же проезд, но доезд после обнаружения явно задан в сантиметрах.
+void lineCross(int speed, int n, float afterCm) {
+    crossing(speed, n, max(0.0f, afterCm), 0, 1);
+}
+
+// Вызов как в твоей библиотеке. Все расстояния — СМ, следующий перекрёсток.
+void line_perekrestok(int speed, float afterCm, float startCm, int stopType) {
+    crossing(speed, 1, max(0.0f, afterCm), startCm, stopType);
+}
+
+// Пересчёт угла поворота НА МЕСТЕ в импульсы каждого колеса.
+long degreesToTicks(float degrees) {
+    if (wheelBaseMm <= 0) stopWithError("STOP: set wheelBaseMm in millimeters.");
+    if (turnCorrection <= 0) stopWithError("STOP: turnCorrection must be positive.");
+    float distanceMm = 3.14159265f * wheelBaseMm * degrees / 360.0f;
+    return (long)(distanceMm / mmPerTick * turnCorrection + 0.5f);
+}
+
+// На месте: плюс — НАЛЕВО, минус — НАПРАВО. Скорость положительная.
+
+void turnTicks(int speed, long ticks) {
+    speed = constrain(speed, 90, 255);
+    stopMotors();
+    if (speed == 0 || ticks == 0) return;
+    waitForStop();
+    long target = ticks > 0 ? ticks : -ticks;
+    int left = ticks > 0 ? -speed : speed;
+    syncTicks(left, -left, target, target / 1.1, target / 1.1, turnTimeout);
+    waitForStop();
+}
+
+// Поворот по энкодерам: плюс градусов НАЛЕВО, минус НАПРАВО.
+void turn(int speed, int degrees) {
+    if (speed <= 0 || degrees == 0) { stopMotors(); return; }
+    long angle = degrees;
+    if (angle < 0) angle = -angle;
+    long ticks = degreesToTicks(angle);
+    turnTicks(speed, degrees > 0 ? ticks : -ticks);
+}
+
+// Идея твоего turn с Клевера: предварительный поворот по энкодерам,
+// затем поиск линии датчиком со стороны поворота и доводка двумя датчиками.
+// degrees — ожидаемый угол: 90 налево, -90 направо, 180 разворот.
+// Вызывать, когда ось колёс уже на перекрёстке.
+
+
+
+void turnToLine(int speed, int degrees) {
+    if (speed <= 0 || degrees == 0) {
+        stopMotors();
+        return;
+    }
+
+    // 1. Основной поворот по энкодерам
+    turn(speed, degrees);
+    waitForStop();
+
+    const int finePWM = 85;
+    const int lineThreshold = 450;
+    const int maxSteps = 3;
+    const int pulseMs = 55;
+
+    int originalSide = degrees > 0 ? 1 : -1;
+    int lastSide = 0;
+
+    // 2. Несколько небольших корректировок
+    for (int i = 0; i < maxSteps; i++) {
+        int l = readLeft();
+        int r = readRight();
+
+        int error = l - r;
+        bool onLine = max(l, r) >= lineThreshold;
+
+        // Уже достаточно точно стоим на линии
+        if (onLine && abs(error) <= turnCenterError) {
+            stopMotors();
+            return;
+        }
+
+        int side;
+
+        if (!onLine) {
+            // Линию пока не увидели:
+            // продолжаем искать в сторону поворота
+            side = originalSide;
+        } else {
+            // Направление коррекции по датчикам
+            side = error > 0 ? 1 : -1;
+
+            // Пересекли положение равновесия:
+            // не начинаем раскачиваться обратно
+            if (lastSide != 0 && side != lastSide) {
+                stopMotors();
+                return;
+            }
+        }
+
+        lastSide = side;
+
+        // 3. Плавный короткий импульс
+        for (int k = 1; k <= 3; k++) {
+            int p = finePWM * k / 3;
+            setPowers(-side * p, side * p);
+            delay(8);
+        }
+
+        delay(pulseMs);
+
+        for (int k = 2; k >= 1; k--) {
+            int p = finePWM * k / 3;
+            setPowers(-side * p, side * p);
+            delay(8);
+        }
+
+        stopMotors();
+        waitForStop();
+    }
+
+    // Если не удалось точно выровняться,
+    // прекращаем корректировки
+    stopMotors();
+    Serial.println("WARNING: turn alignment incomplete");
+}
+
+
+
+
+// Диагностика: белое = 0, чёрное = 1000. raw вписать в white/black наверху.
+// Энкодеры проверяются вращением колёс рукой; моторы здесь выключены.
+void printSensors() {
+    stopMotors();
+    long left, right;
+    readTicks(left, right);
+    Serial.print("L raw: "); Serial.print(readRaw(leftSensorPin));
+    Serial.print("  R raw: "); Serial.print(readRaw(rightSensorPin));
+    Serial.print("  L norm: "); Serial.print(readLeft());
+    Serial.print("  R norm: "); Serial.print(readRight());
+    Serial.print("  L ticks: "); Serial.print(left);
+    Serial.print("  R ticks: "); Serial.println(right);
+    delay(100);
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(L_DIR, OUTPUT); pinMode(L_PWM, OUTPUT);
+    pinMode(R_DIR, OUTPUT); pinMode(R_PWM, OUTPUT);
+    pinMode(leftSensorPin, INPUT); pinMode(rightSensorPin, INPUT);
+    stopMotors();
+    if (leftWhite == leftBlack || rightWhite == rightBlack)
+        stopWithError("STOP: check sensor calibration.");
+    pinMode(encoderLeftPin, INPUT_PULLUP);
+    pinMode(encoderRightPin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(encoderLeftPin), countLeft, RISING);
+    attachInterrupt(digitalPinToInterrupt(encoderRightPin), countRight, RISING);
+    delay(1000);
+}
+
+void loop() {
+    if (calibrationMode) { printSensors(); return; }
+
+    // Короткий первый тест: один проезд по линии на 30 см, затем стоп.
+    turn(baseSpeed+10,90);
+    // lineCross(baseSpeed, 1,5.9);
+    // turnToLine(baseSpeed, -90); 
+    // lineCross(baseSpeed, 1,5.9);
+    // turnToLine(baseSpeed, 90); 
+    // lineCross(baseSpeed, 4,5.9);
+    // turnToLine(baseSpeed, 90); 
+    // lineCross(baseSpeed, 2,5.9);
+    // turnToLine(baseSpeed, 90);
+    // lineCross(baseSpeed, 1,5.9);
+    // turnToLine(baseSpeed, 90);
+    // lineCross(baseSpeed, 2,5.9);
+    // turnToLine(baseSpeed, -90);
+    // lineCross(baseSpeed, 4,5.9);
+    // Примеры. Выполняются только команды без // в начале.
+    // lineEncoder(baseSpeed, 20000);       // прежний тест: примерно 9.14 метра
+    // line_encoder(baseSpeed, 60, 10, 10);  // по линии 60 см, разгон/торможение по 10 см
+    // moveCm(65, 20);                      // без линии вперёд 20 см
+    // moveCm(-65, 20);                     // без линии назад 20 см
+    // sync_move(65, 45, 30, 5, 5);         // дуга, средний путь 30 см
+    // lineCross(baseSpeed, 2);             // второй следующий перекрёсток + доезд до оси
+    // lineCross(baseSpeed, 1, 8);          // после обнаружения доехать прямо 8 см
+    // line_perekrestok(75, 8, 5, 2);        // старый вызов: доезд 8 см, старт 5 см, мягкий стоп
+    // turn(65, 90);                        // налево на 90 градусов по энкодерам
+    // turn(65, -90);                       // направо на 90 градусов по энкодерам
+    // turnToLine(65, 90);                  // налево примерно на 90, доводка по линии
+    // turnToLine(65, -90);                 // то же направо
+    // turnTicks(65, 100);                  // налево: по 100 импульсов каждому колесу
+
+    // Для поворотов turn / turnToLine сначала измерить wheelBaseMm наверху.
+    stopMotors();
+    while (true) delay(100);
+}
