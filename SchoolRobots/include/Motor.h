@@ -11,7 +11,7 @@ const byte R_PWM = 6;
 const byte ENCODER_LEFT_PIN = 2;
 const byte ENCODER_RIGHT_PIN = 3;
 // Настройки езды
-const int BASE_SPEED = 70;
+const int BASE_SPEED = 67;
 const int MIN_PWM = 58;
 const int MAX_CORRECTION = 25;
 const int PWM_STEP = 1;
