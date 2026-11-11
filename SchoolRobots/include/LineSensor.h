@@ -4,10 +4,10 @@
 
 const byte LEFT_SENSOR_PIN = A0;
 const byte RIGHT_SENSOR_PIN = A1;
-const int LEFT_WHITE = 40;
-const int LEFT_BLACK = 780;
-const int RIGHT_WHITE = 40;
-const int RIGHT_BLACK = 740;
+const int LEFT_WHITE = 60;
+const int LEFT_BLACK = 690;
+const int RIGHT_WHITE = 60;
+const int RIGHT_BLACK = 690;
 const int CROSS_THRESHOLD = 850;
 // true: только показания в Serial, моторы стоят
 const bool CALIBRATION_MODE = false;
