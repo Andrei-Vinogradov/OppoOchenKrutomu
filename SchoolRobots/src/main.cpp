@@ -2,6 +2,9 @@
 #include "../include/Motor.h"
 #include "../include/LineSensor.h"
 
+// Строка команд (задавать через пробел)
+char* commands_str = "L L R P R R P P R";
+
 // Считывание ошибки направления и корректировка моторов для удержания линии
 void PD(int speed) 
 {
@@ -317,6 +320,30 @@ void printSensors() {
     delay(100);
 }
 
+// Машина состояний
+void stateMachine()
+{
+    bool is_turn = true;
+    for (int i = 0; i < strlen(commands_str); i += 2)
+    {
+        char current_command_str = commands_str[i];
+        if (current_command_str == 'L')
+        {
+            lineCross(BASE_SPEED, 1);
+            turnToLine(40, 40);
+        }
+        else if (current_command_str == 'R')
+        {
+            lineCross(BASE_SPEED, 1);
+            turnToLine(40, -40);
+        }
+        else if (current_command_str == 'P')
+        {
+            lineCross(BASE_SPEED, 1);
+        }
+    }
+}
+
 void setup() {
     Serial.begin(9600);
     pinMode(L_DIR, OUTPUT); pinMode(L_PWM, OUTPUT);
@@ -329,15 +356,23 @@ void setup() {
     pinMode(ENCODER_RIGHT_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_PIN), countLeft, RISING);
     attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_PIN), countRight, RISING);
+
     delay(1000);
 }
 
 void loop() {
-    if (CALIBRATION_MODE) { printSensors(); return; }
+    //if (CALIBRATION_MODE) { printSensors(); return; }
 
     // Для теста
-    lineCross(BASE_SPEED, 1 /*, 5.9*/);
-    turnToLine(BASE_SPEED - 5, -90);
-    lineCross(BASE_SPEED, 1 /*, 5.9*/);
-    turnToLine(BASE_SPEED - 5, 90);
+    //lineCross(BASE_SPEED, 1 /*, 5.9*/);
+    //turnToLine(BASE_SPEED - 5, -90);
+    //lineCross(BASE_SPEED, 1 /*, 5.9*/);
+    //turnToLine(BASE_SPEED - 5, 90);
+
+    stateMachine();
+    while (true)
+    {
+        delay(200);
+    }
+    
 }
