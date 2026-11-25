@@ -1,31 +1,26 @@
 #include "../include/LineSensor.h"
 
-int minV[N];
-int maxV[N];
-
-void calibration()
+int readRaw(byte pin) 
 {
-    for (int i = 0; i < N; i++) 
-    { 
-        minV[i] = 1023; 
-        maxV[i] = 0; 
-    }
-    // 5 секунд водите робота поперёк линии руками
-    unsigned long t0 = millis();
-    while (millis() - t0 < 5000) 
-    {
-        for (int i = 0; i < N; i++) 
-        {
-            int v = analogRead(PINS[i]);
-            minV[i] = min(minV[i], v);
-            maxV[i] = max(maxV[i], v);
-        }
-    }
+    int sum = 0;
+    for (int i = 0; i < 4; i++) sum += analogRead(pin);
+    return sum / 4;
 }
-
-// 0..1000: один край шкалы — белое, другой — чёрное (какой — проверьте)
-int readNorm(int i) 
+int readSensor(byte pin, int white, int black) 
 {
-  int v = analogRead(PINS[i]);
-  return constrain(map(v, minV[i], maxV[i], 0, 1000), 0, 1000);
+    if (white == black) return 0;
+    long value = map(readRaw(pin), white, black, 0, 1000);
+    return constrain(value, 0L, 1000L);
+}
+int readLeft() 
+{ 
+    return readSensor(LEFT_SENSOR_PIN, LEFT_WHITE, LEFT_BLACK); 
+}
+int readRight() 
+{ 
+    return readSensor(RIGHT_SENSOR_PIN, RIGHT_WHITE, RIGHT_BLACK); 
+}
+bool isCross() 
+{ 
+    return readLeft() >= CROSS_THRESHOLD && readRight() >= CROSS_THRESHOLD; 
 }
