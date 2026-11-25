@@ -107,10 +107,11 @@ void syncMove(int left, int right, float cm, float startCm, float brakeCm){
 void moveCm(int speed, float cm){
     syncMove(speed, speed, cm, 0, 0);
 }
-void crossing(int speed, int n, float afterCm, float startCm, int stopType) {
+void crossing(int speed, int n, float afterCm, float startCm, int stopType, int sideT = 0) {
     speed = constrain(speed, 0, 255);
     if (speed == 0 || n <= 0) { stopMotors(); return; }
     if (stopType < 0 || stopType > 2) stopWithError("STOP: stopType must be 0, 1 or 2.");
+    if (sideT < 0 || sideT > 2) stopWithError("STOP: sideT must be 0, 1 or 2.");
     if (leftPower < 0 || rightPower < 0) stopMotors();
     waitForStop();
     if (startCm > 0)
@@ -119,8 +120,14 @@ void crossing(int speed, int n, float afterCm, float startCm, int stopType) {
     int count = 0;
     bool wasCross = isCross(); // стартовый перекрёсток пропускаем
     long sideStart = -1;       // начало возможного бокового Т, в импульсах
+    int sideSensor = 0;        // 1 — левый, 2 — правый
+    bool sideArmed = sideT != 0;
+    bool sideLatched = false;
+    long sideClearStart = -1;
     long lastCountedAt = -1;   // последний учтённый перекрёсток
     const long minCrossGap = cmToTicks(MIN_CROSS_GAP_CM);
+    const long sideMinTicks = cmToTicks(SIDE_T_MIN_CM);
+    const long sideClearTicks = cmToTicks(SIDE_T_CLEAR_CM);
     lastError = readLeft() - readRight();
     unsigned long started = millis();
     while (count < n) {
@@ -132,23 +139,49 @@ void crossing(int speed, int n, float afterCm, float startCm, int stopType) {
         // Используем ту же пару измерений, что и PD, без лишних analogRead.
         bool cross = lineLeft >= CROSS_THRESHOLD && lineRight >= CROSS_THRESHOLD;
         bool sideCross = false;
-        if (DETECT_SIDE_T && !cross) {
-            bool oneBlack = (lineLeft >= CROSS_THRESHOLD && lineRight <= SIDE_T_OTHER_MAX) ||
-                            (lineRight >= CROSS_THRESHOLD && lineLeft <= SIDE_T_OTHER_MAX);
-            if (oneBlack) {
-                if (sideStart < 0) sideStart = (left + right) / 2;
-                sideCross = (left + right) / 2 - sideStart >= cmToTicks(SIDE_T_MIN_CM);
-            } else sideStart = -1;
-        } else sideStart = -1;
-        if (sideCross) cross = true;
+        if (sideT != 0) {
+            long position = (left + right) / 2;
+            bool leftBranch = sideT == 1 && lineLeft >= SIDE_T_THRESHOLD;
+            bool rightBranch = sideT == 2 && lineRight >= SIDE_T_THRESHOLD;
+            int currentSideSensor = leftBranch ? 1 : (rightBranch ? 2 : 0);
+            bool sideClear = lineLeft <= SIDE_T_OTHER_MAX && lineRight <= SIDE_T_OTHER_MAX;
+
+            if (sideClear) {
+                sideStart = -1;
+                sideSensor = 0;
+                if (sideClearStart < 0) sideClearStart = position;
+                if (position - sideClearStart >= sideClearTicks) {
+                    sideLatched = false;
+                    sideArmed = true;
+                }
+            } else {
+                sideClearStart = -1;
+                if (sideArmed && !sideLatched) {
+                    if (currentSideSensor != 0 && sideSensor != currentSideSensor) {
+                        sideSensor = currentSideSensor;
+                        sideStart = position;
+                    }
+                    if (currentSideSensor != 0)
+                        sideCross = position - sideStart >= sideMinTicks;
+                    else {
+                        sideStart = -1;
+                        sideSensor = 0;
+                    }
+                } else {
+                    sideStart = -1;
+                    sideSensor = currentSideSensor;
+                }
+            }
+        }
+        if (sideCross || sideLatched) cross = true;
         if (cross != wasCross) {
             delay(10);
             int checkL = readLeft(), checkR = readRight();
             bool confirmed = checkL >= CROSS_THRESHOLD && checkR >= CROSS_THRESHOLD;
-            if (DETECT_SIDE_T && sideCross) {
-                // За время подтверждения должен остаться чёрным тот же датчик.
-                confirmed = (lineLeft >= CROSS_THRESHOLD && checkL >= CROSS_THRESHOLD && checkR <= SIDE_T_OTHER_MAX) ||
-                            (lineRight >= CROSS_THRESHOLD && checkR >= CROSS_THRESHOLD && checkL <= SIDE_T_OTHER_MAX);
+            if (sideT != 0 && sideCross) {
+                confirmed = sideSensor == 1
+                    ? lineLeft >= SIDE_T_THRESHOLD && checkL >= SIDE_T_THRESHOLD
+                    : lineRight >= SIDE_T_THRESHOLD && checkR >= SIDE_T_THRESHOLD;
             }
             if (confirmed == cross) {
                 if (cross) {
@@ -156,6 +189,10 @@ void crossing(int speed, int n, float afterCm, float startCm, int stopType) {
                     if (lastCountedAt < 0 || position - lastCountedAt >= minCrossGap) {
                         count++;
                         lastCountedAt = position;
+                    }
+                    if (sideCross) {
+                        sideLatched = true;
+                        sideStart = -1;
                     }
                 }
                 wasCross = cross;
@@ -191,6 +228,9 @@ void lineCross(int speed, int n) {
 // Тот же проезд, но доезд после обнаружения явно задан в сантиметрах.
 void lineCross(int speed, int n, float afterCm) {
     crossing(speed, n, max(0.0f, afterCm), 0, 1);
+}
+void lineCrossSideT(int speed, int n, int side) {
+    crossing(speed, n, axisOffsetCm, 0, 1, side);
 }
 // Вызов как в твоей библиотеке. Все расстояния — СМ, следующий перекрёсток.
 void line_perekrestok(int speed, float afterCm, float startCm, int stopType) {
@@ -247,9 +287,12 @@ void turnToLine(int speed, int degrees)
     }
 
     // доводка до линии по датчику
-    const int alignPWM = 63;
+    const int alignPWM = TURN_ALIGN_PWM;
     const int lineDetect = 500;
     unsigned long started = millis();
+    bool foundLine = false;
+    bool lineArmed = false;
+    resetEncoders();
 
     while (millis() - started < 1500) 
     {
@@ -258,14 +301,22 @@ void turnToLine(int speed, int degrees)
 
         // при повороте налево (dir == 1) линию первым пересекает правый датчик (r)
         // при повороте направо (dir == -1) линию первым пересекает левый датчик (l)
-        if ((dir == 1 && r >= lineDetect) || (dir == -1 && l >= lineDetect)) {
+        int targetValue = dir == 1 ? r : l;
+        if (!lineArmed) {
+            if (targetValue <= LINE_CLEAR_THRESHOLD) lineArmed = true;
+        } else if (targetValue >= lineDetect) {
+            foundLine = true;
             break;
         }
+        long left, right;
+        readTicks(left, right);
+        checkEncoders(left, right, true, true);
         setPowers(-dir * alignPWM, dir * alignPWM);
     }
 
     stopMotors();
     waitForStop();
+    if (!foundLine) stopWithError("STOP: line not found during turn alignment.");
 }
 // Диагностика: белое = 0, чёрное = 1000. raw вписать в white/black наверху.
 // Энкодеры проверяются вращением колёс рукой; моторы здесь выключены.
@@ -285,9 +336,9 @@ void printSensors() {
 // Машина состояний
 void stateMachine()
 {
-    bool is_turn = true;
     for (int i = 0; i < strlen(commands_str); i += 2)
     {
+        int commandNumber = i / 2 + 1;
         char current_command_str = commands_str[i];
         if (current_command_str == 'L')
         {
@@ -296,7 +347,10 @@ void stateMachine()
         }
         else if (current_command_str == 'R')
         {
-            lineCross(BASE_SPEED, 1);
+            if (commandNumber == 3 || commandNumber == 5)
+                lineCrossSideT(BASE_SPEED, 1, 2);
+            else
+                lineCross(BASE_SPEED, 1);
             turnToLine(BASE_SPEED, -90);
         }
         else if (current_command_str == 'P')
