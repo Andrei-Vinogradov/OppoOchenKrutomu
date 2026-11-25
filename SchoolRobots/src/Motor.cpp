@@ -1,6 +1,6 @@
 #include "../include/Motor.h"
 
-float Kp = 0.016;
+float Kp = 0.01;
 float Kd = 0.6;
 float Kp_sync = 0.35;
 float Kd_sync = 0.1;
