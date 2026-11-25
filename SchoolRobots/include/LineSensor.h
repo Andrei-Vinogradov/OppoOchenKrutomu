@@ -4,14 +4,16 @@
 
 const byte LEFT_SENSOR_PIN = A0;
 const byte RIGHT_SENSOR_PIN = A1;
-const int LEFT_WHITE = 50;
-const int LEFT_BLACK = 665;
-const int RIGHT_WHITE = 80;
-const int RIGHT_BLACK = 670;
+const int LEFT_WHITE = 35;
+const int LEFT_BLACK = 660;
+const int RIGHT_WHITE = 44;
+const int RIGHT_BLACK = 667;
 const int CROSS_THRESHOLD = 850;
+const int LINE_CLEAR_THRESHOLD = 350;
 const bool CALIBRATION_MODE = false;
-const bool DETECT_SIDE_T = false;
-const float SIDE_T_MIN_CM = 1.5f;
+const int SIDE_T_THRESHOLD = 250;
+const float SIDE_T_MIN_CM = 0.5f;
+const float SIDE_T_CLEAR_CM = 2.0f;
 const int SIDE_T_OTHER_MAX = 350;
 const float MIN_CROSS_GAP_CM = 4.0f;
 
